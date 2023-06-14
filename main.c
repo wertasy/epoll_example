@@ -63,9 +63,15 @@ struct conn {
     char *errmsg;
 };
 
+void head_destory(struct http_head *head) {
+    free(head->method);
+    free(head->path);
+}
+
 void conn_destory(struct conn *c) {
     close(c->fd);
     free(c->buf.ptr);
+    head_destory(&c->head);
     free(c);
 }
 
@@ -287,11 +293,11 @@ void handle_conn(struct conn *c) {
 reply:
 
 #define RSP                                                                    \
-    "HTTP/1.1 200 OK\r\n"                                                      \
+    "HTTP/1.0 200 OK\r\n"                                                      \
     "Content-Length: 5\r\n"                                                    \
     "\r\n"                                                                     \
     "hello"
-    write(c->fd, RSP, sizeof(RSP));
+    write(c->fd, RSP, sizeof(RSP) - 1);
 
     return;
 
