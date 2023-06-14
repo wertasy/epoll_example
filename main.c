@@ -3,12 +3,16 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <netinet/in.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_EVS 10
@@ -30,83 +34,271 @@ struct server {
     struct epoll_event evs[MAX_EVS];
 };
 
+struct buff {
+    char *ptr;
+    size_t len;
+    size_t cap;
+};
+
+struct http_head {
+    char *method;
+    char *path;
+    size_t content_size;
+};
+
+enum head_state {
+    st_read_request_line,
+    st_read_content_size,
+    st_read_crlf,
+    st_read_request_body,
+    st_done,
+};
+
 struct conn {
     int fd;
-    struct sockaddr_in remote_addr;
-    char buf[N];
+    enum head_state state;
+    struct sockaddr_in addr;
+    struct buff buf;
+    struct http_head head;
+    char *errmsg;
 };
 
 void conn_destory(struct conn *c) {
     close(c->fd);
+    free(c->buf.ptr);
     free(c);
 }
 
-struct conn *accept_conn(struct server *ctx) {
-    assert(ctx);
+struct conn *accept_conn(struct server *s) {
+    assert(s);
 
     struct conn *c = malloc(sizeof(struct conn));
     if (!c) {
         return NULL;
     }
 
-    socklen_t socklen = sizeof(c->remote_addr);
-    c->fd = accept(ctx->listenfd, (struct sockaddr *)&c->remote_addr, &socklen);
+    bzero(c, sizeof(struct conn));
+
+    socklen_t socklen = sizeof(c->addr);
+    c->fd = accept(s->listenfd, (struct sockaddr *)&c->addr, &socklen);
     if (c->fd < 0) {
-        goto cleanup;
+        goto cleanup0;
     }
 
     fprintf(stderr, "accept connection form %s:%u\n",
-            inet_ntoa(c->remote_addr.sin_addr), ntohs(c->remote_addr.sin_port));
+            inet_ntoa(c->addr.sin_addr), ntohs(c->addr.sin_port));
 
     if (setnonblocking(c->fd) < 0) {
-        goto cleanup;
+        goto cleanup1;
     }
 
-    struct epoll_event ev = {0};
-    ev.events = EPOLLIN | EPOLLET;
-    ev.data.ptr = c;
+    struct epoll_event ev = {
+        .events = EPOLLIN | EPOLLET,
+        .data.ptr = c,
+    };
 
-    if (epoll_ctl(ctx->epollfd, EPOLL_CTL_ADD, c->fd, &ev) < 0) {
-        goto cleanup;
+    if (epoll_ctl(s->epollfd, EPOLL_CTL_ADD, c->fd, &ev) < 0) {
+        goto cleanup1;
     }
 
     return c;
 
-cleanup:
+cleanup1:
+    close(c->fd);
+
+cleanup0:
     free(c);
+
     return NULL;
+}
+
+ssize_t buf_write(struct buff *buf, char *data, size_t size) {
+    if (buf->ptr == NULL || buf->cap == 0) {
+        buf->len = 0;
+        buf->cap = size;
+        buf->ptr = malloc(buf->cap);
+        if (buf->ptr == NULL) {
+            return -1;
+        }
+    }
+
+    size_t new_len = buf->len + size;
+    if (buf->cap < new_len) {
+        size_t new_cap = 2 * buf->cap;
+        while (new_cap < new_len) {
+            new_cap *= 2;
+        }
+        char *new_ptr = realloc(buf->ptr, new_cap);
+        if (new_ptr == NULL) {
+            return -1;
+        }
+        buf->ptr = new_ptr;
+        buf->cap = new_cap;
+    }
+
+    memcpy(buf->ptr + buf->len, data, size);
+    buf->len += size;
+
+    return size;
+}
+
+void buff_clear(struct buff *buf) {
+    buf->len = 0;
+    bzero(buf->ptr, buf->cap);
+}
+
+int parse_content_size(struct http_head *head, char *buf, size_t n) {
+#define CONTENT_LENGTH "Content-Length"
+    char tmpbuf[20] = {0};
+    if (!strncasecmp(buf, CONTENT_LENGTH, sizeof(CONTENT_LENGTH) - 1)) {
+        char *p = buf + sizeof(CONTENT_LENGTH) - 1;
+        while ((p < buf + n) && (*p == ' ' || *p == ':')) {
+            p++;
+        }
+        strncpy(tmpbuf, p, n);
+        size_t s = strtoul(tmpbuf, NULL, 10);
+        if (errno == ERANGE) {
+            return -1;
+        }
+        head->content_size = s;
+    }
+    return 1;
+}
+
+int parse_request_line(struct http_head *head, char *buf) {
+    int rc = 0;
+    for (int i = 0; i < 2; buf = NULL, i++) {
+        char *t = strtok(buf, " ");
+        if (t == NULL) {
+            return 0;
+        }
+        if (i == 0) {
+            head->method = strdup(t);
+            rc++;
+        }
+        if (i == 1) {
+            head->path = strdup(t);
+            rc++;
+        }
+    }
+    return rc;
+}
+
+int conn_read_body(struct conn *c) {
+    if (c->buf.len < c->head.content_size) {
+        return -1;
+    }
+    return 0;
+}
+
+int conn_read_head(struct conn *c) {
+    char *p = memchr(c->buf.ptr, '\r', c->buf.len);
+    if (p != NULL && !strncmp(p, "\r\n", 2)) {
+        // got a new line
+        switch (c->state) {
+        case st_read_request_line:
+            if (parse_request_line(&c->head, c->buf.ptr) != 2) {
+                c->errmsg = "fail to parse request lien";
+                return -1;
+            }
+
+            c->state = st_read_content_size;
+            goto clearbuff;
+
+        case st_read_content_size:
+            if (parse_content_size(&c->head, c->buf.ptr, c->buf.len) != 1) {
+                c->errmsg = "fail to parse content size";
+                return -1;
+            }
+
+            c->state = st_read_crlf;
+            goto clearbuff;
+
+        case st_read_crlf:
+            if (c->buf.ptr == p) {
+                if (c->head.content_size == 0) {
+                    c->state = st_done;
+                } else {
+                    c->state = st_read_request_body;
+                }
+            }
+
+            goto clearbuff;
+        case st_done:
+        case st_read_request_body:
+            c->errmsg = "err state";
+            return -1;
+        }
+    }
+
+    return 0;
+
+clearbuff:
+    buff_clear(&c->buf);
+    return 0;
 }
 
 void handle_conn(struct conn *c) {
     assert(c);
 
+    char buf[10];
     for (;;) {
-        memset(c->buf, 0, N);
-        int nr = read(c->fd, c->buf, N);
-        if (nr < 0) {
-            if (errno != EAGAIN) {
-                perror("read");
-                goto cleanup;
+        bzero(buf, 10);
+        int n = read(c->fd, buf, 10);
+        if (n < 0) {
+            if (errno == EAGAIN) {
+                return;
             }
-            return;
-        }
 
-        if (nr == 0) {
-            fprintf(stderr, "connection %s:%u closed\n",
-                    inet_ntoa(c->remote_addr.sin_addr),
-                    ntohs(c->remote_addr.sin_port));
+            perror("read");
             goto cleanup;
+        }
+
+        if (n == 0) {
+            fprintf(stderr, "connection %s:%u closed\n",
+                    inet_ntoa(c->addr.sin_addr), ntohs(c->addr.sin_port));
+            goto cleanup;
+        }
+
+        if (c->state == st_done) {
             return;
+        } else if (c->state == st_read_request_body) {
+            size_t remain = c->head.content_size - c->buf.len;
+            if (n <= remain) {
+                buf_write(&c->buf, buf, n);
+            } else {
+                buf_write(&c->buf, buf, remain);
+                c->state = st_done;
+                goto reply;
+            }
+        } else {
+            buf_write(&c->buf, buf, n);
+            if (conn_read_head(c) < 0) {
+                goto badreq;
+            }
+            if (c->state == st_done) {
+                goto reply;
+            }
         }
-
-        for (int i = 0; i < N; i++) {
-            c->buf[i] = toupper(c->buf[i]);
-        }
-
-        write(c->fd, c->buf, nr);
     }
 
     return;
+
+reply:
+
+#define RSP                                                                    \
+    "HTTP/1.1 200 OK\r\n"                                                      \
+    "Content-Length: 5\r\n"                                                    \
+    "\r\n"                                                                     \
+    "hello"
+    write(c->fd, RSP, sizeof(RSP));
+
+    return;
+
+badreq:
+    if (c->errmsg != NULL) {
+        write(c->fd, c->errmsg, strlen(c->errmsg));
+    }
 
 cleanup:
     conn_destory(c);
@@ -117,6 +309,8 @@ struct server *create_server(const char *host, uint16_t port) {
     if (!s) {
         return NULL;
     }
+
+    bzero(s, sizeof(struct conn));
 
     s->addr.sin_family = AF_INET;
     s->addr.sin_addr.s_addr = inet_addr(host);
