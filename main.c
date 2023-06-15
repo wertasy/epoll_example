@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include <arpa/inet.h>
 #include <assert.h>
 #include <ctype.h>
@@ -7,6 +9,7 @@
 #include <netinet/in.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -47,19 +50,18 @@ struct http_head {
 };
 
 enum head_state {
-    st_read_request_line,
-    st_read_content_size,
-    st_read_crlf,
-    st_read_request_body,
-    st_done,
+    ST_READ_REQUEST_LINE,
+    ST_READ_CONTENT_SIZE,
+    ST_READ_REQUEST_BODY,
+    ST_READ_REQUEST_DONE,
 };
 
 struct conn {
     int fd;
     enum head_state state;
     struct sockaddr_in addr;
-    struct buff buf;
-    struct http_head head;
+    struct buff buf[1];
+    struct http_head head[1];
     char *errmsg;
 };
 
@@ -70,8 +72,8 @@ void head_destory(struct http_head *head) {
 
 void conn_destory(struct conn *c) {
     close(c->fd);
-    free(c->buf.ptr);
-    head_destory(&c->head);
+    free(c->buf->ptr);
+    head_destory(c->head);
     free(c);
 }
 
@@ -91,8 +93,7 @@ struct conn *accept_conn(struct server *s) {
         goto cleanup0;
     }
 
-    fprintf(stderr, "accept connection form %s:%u\n",
-            inet_ntoa(c->addr.sin_addr), ntohs(c->addr.sin_port));
+    fprintf(stderr, "accept connection form %s:%u\n", inet_ntoa(c->addr.sin_addr), ntohs(c->addr.sin_port));
 
     if (setnonblocking(c->fd) < 0) {
         goto cleanup1;
@@ -118,7 +119,7 @@ cleanup0:
     return NULL;
 }
 
-ssize_t buf_write(struct buff *buf, char *data, size_t size) {
+ssize_t buff_write(struct buff *buf, char *data, size_t size) {
     if (buf->ptr == NULL || buf->cap == 0) {
         buf->len = 0;
         buf->cap = size;
@@ -191,47 +192,60 @@ int parse_request_line(struct http_head *head, char *buf) {
 }
 
 int conn_read_body(struct conn *c) {
-    if (c->buf.len < c->head.content_size) {
+    if (c->buf->len < c->head->content_size) {
         return -1;
     }
     return 0;
 }
 
+void buff_rebase(struct buff *buf, char *base, size_t n) {
+    strncpy(buf->ptr, base, n);
+    bzero(buf->ptr + n, buf->cap - n);
+    buf->len = n;
+}
+
 int conn_read_head(struct conn *c) {
-    char *p = memchr(c->buf.ptr, '\r', c->buf.len);
-    if (p != NULL && !strncmp(p, "\r\n", 2)) {
-        // got a new line
+    char *p = memchr(c->buf->ptr, '\r', c->buf->len);
+    if (p == NULL) {
+        return 0;
+    }
+
+    char *remain_ptr = p + 2;
+    ssize_t remain_len = c->buf->len - (remain_ptr - c->buf->ptr);
+
+    if (remain_len >= 0 && !strncmp(p, "\r\n", 2)) {
+
         switch (c->state) {
-        case st_read_request_line:
-            if (parse_request_line(&c->head, c->buf.ptr) != 2) {
+        case ST_READ_REQUEST_LINE:
+            if (parse_request_line(c->head, c->buf->ptr) != 2) {
                 c->errmsg = "fail to parse request lien";
                 return -1;
             }
 
-            c->state = st_read_content_size;
-            goto clearbuff;
+            c->state = ST_READ_CONTENT_SIZE;
+            goto rebasebuff;
 
-        case st_read_content_size:
-            if (parse_content_size(&c->head, c->buf.ptr, c->buf.len) != 1) {
+        case ST_READ_CONTENT_SIZE:
+            if (c->buf->ptr == p) {
+                // got crlf
+                if (c->head->content_size == 0) {
+                    c->state = ST_READ_REQUEST_DONE;
+                } else {
+                    c->state = ST_READ_REQUEST_BODY;
+                }
+
+                goto rebasebuff;
+            }
+
+            if (parse_content_size(c->head, c->buf->ptr, c->buf->len) != 1) {
                 c->errmsg = "fail to parse content size";
                 return -1;
             }
 
-            c->state = st_read_crlf;
-            goto clearbuff;
+            goto rebasebuff;
 
-        case st_read_crlf:
-            if (c->buf.ptr == p) {
-                if (c->head.content_size == 0) {
-                    c->state = st_done;
-                } else {
-                    c->state = st_read_request_body;
-                }
-            }
-
-            goto clearbuff;
-        case st_done:
-        case st_read_request_body:
+        case ST_READ_REQUEST_DONE:
+        case ST_READ_REQUEST_BODY:
             c->errmsg = "err state";
             return -1;
         }
@@ -239,18 +253,38 @@ int conn_read_head(struct conn *c) {
 
     return 0;
 
-clearbuff:
-    buff_clear(&c->buf);
+rebasebuff:
+    buff_rebase(c->buf, remain_ptr, remain_len);
+
+    if (c->buf->len >= 2 && !strncmp(c->buf->ptr, "\r\n", 2)) {
+        c->state = ST_READ_REQUEST_DONE;
+    }
+
     return 0;
+}
+
+int buff_printf(struct buff *buf, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+
+    char *pstr = NULL;
+    int n = vasprintf(&pstr, fmt, ap);
+    if (n > 0) {
+        buff_write(buf, pstr, n);
+        free(pstr);
+    }
+
+    va_end(ap);
+    return n;
 }
 
 void handle_conn(struct conn *c) {
     assert(c);
 
-    char buf[10];
+    char buf[N];
     for (;;) {
-        bzero(buf, 10);
-        int n = read(c->fd, buf, 10);
+        bzero(buf, N);
+        int n = read(c->fd, buf, N);
         if (n < 0) {
             if (errno == EAGAIN) {
                 return;
@@ -261,28 +295,28 @@ void handle_conn(struct conn *c) {
         }
 
         if (n == 0) {
-            fprintf(stderr, "connection %s:%u closed\n",
-                    inet_ntoa(c->addr.sin_addr), ntohs(c->addr.sin_port));
+            fprintf(stderr, "connection %s:%u closed\n", inet_ntoa(c->addr.sin_addr), ntohs(c->addr.sin_port));
             goto cleanup;
         }
 
-        if (c->state == st_done) {
+        if (c->state == ST_READ_REQUEST_DONE) {
             return;
-        } else if (c->state == st_read_request_body) {
-            size_t remain = c->head.content_size - c->buf.len;
+        } else if (c->state == ST_READ_REQUEST_BODY) {
+            size_t remain = c->head->content_size - c->buf->len;
             if (n <= remain) {
-                buf_write(&c->buf, buf, n);
+                buff_write(c->buf, buf, n);
             } else {
-                buf_write(&c->buf, buf, remain);
-                c->state = st_done;
+                buff_write(c->buf, buf, remain);
+                c->state = ST_READ_REQUEST_DONE;
                 goto reply;
             }
         } else {
-            buf_write(&c->buf, buf, n);
+            buff_write(c->buf, buf, n);
             if (conn_read_head(c) < 0) {
+                c->state = ST_READ_REQUEST_DONE;
                 goto badreq;
             }
-            if (c->state == st_done) {
+            if (c->state == ST_READ_REQUEST_DONE) {
                 goto reply;
             }
         }
@@ -291,20 +325,33 @@ void handle_conn(struct conn *c) {
     return;
 
 reply:
+    fprintf(stderr, "%s %s\n", c->head->method, c->head->path);
 
-#define RSP                                                                    \
-    "HTTP/1.0 200 OK\r\n"                                                      \
-    "Content-Length: 5\r\n"                                                    \
-    "\r\n"                                                                     \
+#define RSP                                                                                                            \
+    "HTTP/1.0 200 OK\r\n"                                                                                              \
+    "Content-Length: 5\r\n"                                                                                            \
+    "\r\n"                                                                                                             \
     "hello"
     write(c->fd, RSP, sizeof(RSP) - 1);
 
     return;
 
 badreq:
+#define STATUS_LINE_400                                                                                                \
+    "HTTP/1.0 400 Bad Request\r\n"
+
+    buff_clear(c->buf);
+    buff_write(c->buf, STATUS_LINE_400, sizeof(STATUS_LINE_400) - 1);
+
     if (c->errmsg != NULL) {
-        write(c->fd, c->errmsg, strlen(c->errmsg));
+        buff_printf(c->buf, "Content-Length: %ld\r\n\r\n%s", strlen(c->errmsg), c->errmsg);
+    } else {
+        buff_write(c->buf, "\r\n", 2);
     }
+
+    write(c->fd, c->buf->ptr, c->buf->len);
+    return;
+
 
 cleanup:
     conn_destory(c);
@@ -324,12 +371,12 @@ struct server *create_server(const char *host, uint16_t port) {
 
     s->listenfd = socket(AF_INET, SOCK_STREAM, 0);
     if (s->listenfd < 0) {
-        goto cleanup1;
+        goto cleanup0;
     }
 
     s->epollfd = epoll_create1(0);
     if (s->epollfd < 0) {
-        goto cleanup2;
+        goto cleanup1;
     }
 
     struct epoll_event ev = {
@@ -338,18 +385,18 @@ struct server *create_server(const char *host, uint16_t port) {
     };
 
     if (epoll_ctl(s->epollfd, EPOLL_CTL_ADD, s->listenfd, &ev) < 0) {
-        goto cleanup3;
+        goto cleanup2;
     }
 
     return s;
 
-cleanup3:
+cleanup2:
     close(s->epollfd);
 
-cleanup2:
+cleanup1:
     close(s->listenfd);
 
-cleanup1:
+cleanup0:
     free(s);
     return NULL;
 }
@@ -366,13 +413,11 @@ int listen_and_serve(struct server *s, void (*phandler)(struct conn *)) {
     int rc = 0;
     int enable = 1;
 
-    if ((rc = setsockopt(s->listenfd, SOL_SOCKET, SO_REUSEADDR, &enable,
-                         sizeof(enable))) < 0) {
+    if ((rc = setsockopt(s->listenfd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable))) < 0) {
         return rc;
     }
 
-    if ((rc = bind(s->listenfd, (struct sockaddr *)&s->addr, sizeof(s->addr))) <
-        0) {
+    if ((rc = bind(s->listenfd, (struct sockaddr *)&s->addr, sizeof(s->addr))) < 0) {
         return rc;
     }
 
